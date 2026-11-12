@@ -206,6 +206,24 @@ fn right_switch(remote: &dm_mc02::Dr16) -> u8 {
 fn left_switch(remote: &dm_mc02::Dr16) -> u8 {
     remote.left_switch
 }
+/// 单环 PID 的配置项：现场调参改这里。
+///
+/// 用字段名而不是“第几个参数”，避免记错位置：
+/// - `kp`：比例增益。位置环单位 rpm/rad；速度环单位 电压原始值/rpm。
+/// - `ki`：积分增益。默认 0；有稳态偏差（如 pitch 下垂）才加小量。
+/// - `kd`：微分增益。默认 0；超调大才加，对噪声敏感。
+/// - `maxout`：本环输出的对称上限。位置环 = 目标转速上限(rpm)；速度环 = 台架电压上限。
+/// - `integral_limit`：积分累计限幅，防积分饱和。
+#[derive(Clone, Copy)]
+pub struct PidConfig {
+    pub kp: f32,
+    pub ki: f32,
+    pub kd: f32,
+    pub maxout: f32,
+    pub integral_limit: f32,
+}
+
+/// PID 单环控制器：参数来自 `PidConfig`，积分/微分历史保存在内部。
 #[derive(Default)]
 pub struct Pid {
     pub kp: f32,
@@ -220,13 +238,13 @@ pub struct Pid {
 }
 
 impl Pid {
-    pub fn new(kp: f32, ki: f32, kd: f32, maxout: f32, integral_limit: f32) -> Self {
+    pub fn new(config: PidConfig) -> Self {
         Self {
-            kp,
-            ki,
-            kd,
-            maxout,
-            integral_limit,
+            kp: config.kp,
+            ki: config.ki,
+            kd: config.kd,
+            maxout: config.maxout,
+            integral_limit: config.integral_limit,
             last_output: 0.0,
             integral: 0.0,
             previous_error: 0.0,
@@ -487,6 +505,8 @@ pub struct Control {
     /// 上一周期的拨杆位置，用于识别“一次新的操作”。
     pub last_right_switch: u8,
     pub last_left_switch: u8,
+    /// 恢复手势“已先下拨”记忆（拨杆下→上会经过中位，不能用相邻周期边沿）。
+    pub recovery_armed: bool,
     /// 限频打印编码结果用的计数（约 1 s 一次）。
     pub transmit_log_ticks: u16,
 }
@@ -503,9 +523,21 @@ impl Default for Control {
                 min_rad: YAW_MIN_RAD,
                 max_rad: YAW_MAX_RAD,
                 // 位置环：rad → rpm（maxout=0 时输出恒 0，用于单独调速度环）
-                position_pid: Pid::new(2.0, 0.0, 0.0, 120.0, 400.0),
+                position_pid: Pid::new(PidConfig {
+                    kp: 2.0,               // 位置环 P：现场建议从 100.0 起试（默认 2 偏慢）
+                    ki: 0.0,               // 位置环 I：默认 0
+                    kd: 0.0,               // 位置环 D：超调大再给 0.05~0.2
+                    maxout: 120.0,         // 输出上限=目标转速上限(rpm)；单独调速度环时改 0.0
+                    integral_limit: 400.0, // 积分限幅
+                }),
                 // 速度环：rpm → 电压原始值（maxout 是台架输出上限）
-                speed_pid: Pid::new(30.0, 0.0, 0.0, 5000.0, 3000.0),
+                speed_pid: Pid::new(PidConfig {
+                    kp: 30.0,               // 速度环 P：30→60→100…（抖就退回 2/3）
+                    ki: 0.0,                // 速度环 I：pitch 下垂时才加 0.5~1.0
+                    kd: 0.0,                // 速度环 D：一般保持 0
+                    maxout: 5000.0,         // 台架电压上限（协议 ±25000，调试先小）
+                    integral_limit: 3000.0, // 积分限幅
+                }),
                 osc_min_error: f32::MAX,
                 osc_max_error: f32::MIN,
                 ..Axis::default()
@@ -515,8 +547,20 @@ impl Default for Control {
                 direction: PITCH_DIRECTION,
                 min_rad: Some(PITCH_MIN_RAD),
                 max_rad: Some(PITCH_MAX_RAD),
-                position_pid: Pid::new(2.0, 0.0, 0.0, 100.0, 400.0),
-                speed_pid: Pid::new(25.0, 0.0, 0.0, 4000.0, 3000.0),
+                position_pid: Pid::new(PidConfig {
+                    kp: 2.0,               // 位置环 P：现场建议从 100.0 起试
+                    ki: 0.0,               // 位置环 I：默认 0
+                    kd: 0.0,               // 位置环 D：超调大再给 0.05~0.2
+                    maxout: 100.0,         // 输出上限=目标转速上限(rpm)；单独调速度环时改 0.0
+                    integral_limit: 400.0, // 积分限幅
+                }),
+                speed_pid: Pid::new(PidConfig {
+                    kp: 25.0,               // 速度环 P：25→50→80…（抖就退回 2/3）
+                    ki: 0.0,                // 速度环 I：下垂时才加
+                    kd: 0.0,                // 速度环 D：一般保持 0
+                    maxout: 4000.0,         // 台架电压上限
+                    integral_limit: 3000.0, // 积分限幅
+                }),
                 osc_min_error: f32::MAX,
                 osc_max_error: f32::MIN,
                 ..Axis::default()
@@ -529,6 +573,7 @@ impl Default for Control {
             enable_armed: false,
             last_right_switch: 0,
             last_left_switch: 0,
+            recovery_armed: false,
             transmit_log_ticks: 0,
         }
     }
@@ -694,17 +739,28 @@ impl Control {
     }
 
     /// Error：保持零输出，等待人工恢复。
-    /// 恢复动作：右上拨杆保持中位(3)，左上拨杆先下拨(2)再上拨(1)。要求 2→1 的边沿。
+    /// 恢复动作：右上保持中位(3)，左上先下拨(2)武装、再上拨(1)触发（拨杆会经过中位，用记忆不用相邻边沿）。
     fn update_mode_error(&mut self, remote: Option<dm_mc02::Dr16>) {
         let Some(remote) = remote else {
             // 断联时保持 Error，输出为 0；重连后仍需人工恢复。
             return;
         };
+
         let right = right_switch(&remote);
         let left = left_switch(&remote);
-        let recovery_gesture =
-            right == 3 && self.last_right_switch == 3 && self.last_left_switch == 2 && left == 1;
-        if recovery_gesture && self.feedback_fresh() {
+
+        // 恢复手势要求右上保持中位；离开中位就作废本次手势。
+        if right != 3 {
+            self.recovery_armed = false;
+            return;
+        }
+        // 先下拨(2)：武装。注意拨杆从下位拨到上位一定会经过中位，
+        // 所以不能用“上一周期恰好是 2”的边沿判断，否则永远等不到。
+        if left == 2 {
+            self.recovery_armed = true;
+        }
+        // 再上拨(1)：触发一次恢复；要求反馈新鲜。
+        if left == 1 && self.recovery_armed && self.feedback_fresh() {
             self.recover_from_error();
         }
     }
@@ -781,6 +837,7 @@ impl Control {
         self.yaw.reset_detection();
         self.pitch.reset_detection();
         self.fault = None;
+        self.recovery_armed = false;
         self.state = State::Running;
         rtt_target::rprintln!(
             "[state] Running: 人工恢复，目标=当前角度 yaw={:.3} pitch={:.3} rad",
@@ -808,6 +865,7 @@ impl Control {
         self.state = State::Error;
         self.fault = Some(fault);
         self.enable_armed = false;
+        self.recovery_armed = false;
         match fault {
             Fault::YawStall => {
                 rtt_target::rprintln!(
