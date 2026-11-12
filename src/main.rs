@@ -25,15 +25,15 @@ const FEEDBACK_TIMEOUT_TICKS: u16 = 20;
 const ANGLE_RAD_PER_COUNT: f32 = core::f32::consts::TAU / 8192.0;
 /// 参考姿态（yaw 正前方 / pitch 水平）的机械角原始计数。
 /// `None` = 还没标定：不自动回正、限位也不生效，只保持上电姿态。
-const YAW_REFERENCE_RAW: Option<u16> = None;
-const PITCH_REFERENCE_RAW: Option<u16> = None;
+const YAW_REFERENCE_RAW: Option<u16> = Some(3422);
+const PITCH_REFERENCE_RAW: Option<u16> = Some(4153);
 /// 安装方向：反馈正方向与关节正方向相反时改成 -1.0。
 const YAW_DIRECTION: f32 = 1.0;
 const PITCH_DIRECTION: f32 = 1.0;
-/// pitch 机械限位（rad，相对参考姿态）。明天按实际行程改。
-const PITCH_MIN_RAD: f32 = -0.7;
-const PITCH_MAX_RAD: f32 = 0.7;
-/// yaw 若因线缆不能整圈，改成 Some(..) 限幅；保持 None 就按最短路径回绕。
+/// pitch 机械限位（rad，相对参考姿态）。实测 a 极限 2.97~3.43 rad，参考 4153(≈3.185 rad)，
+/// 换算关节角约 -0.215~+0.245 rad；下面留约 0.02 rad 余量。
+const PITCH_MIN_RAD: f32 = -0.195;
+const PITCH_MAX_RAD: f32 = 0.225;
 const YAW_MIN_RAD: Option<f32> = None;
 const YAW_MAX_RAD: Option<f32> = None;
 
@@ -48,25 +48,29 @@ const YAW_MAX_TARGET_RATE_RAD_S: f32 = 1.5;
 const PITCH_MAX_TARGET_RATE_RAD_S: f32 = 1.0;
 /// 回正：限目标速度、限输出幅值、限每周期输出变化。
 const PREPARE_MAX_TARGET_RPM: f32 = 150.0;
-const PREPARE_MAX_OUTPUT_RAW: f32 = 4000.0;
-const PREPARE_MAX_OUTPUT_STEP_RAW: f32 = 60.0;
+const PREPARE_MAX_OUTPUT_RAW: f32 = 12000.0;
+const PREPARE_MAX_OUTPUT_STEP_RAW: f32 = 30.0;
+/// Running 阶段每 1 ms 允许的电压变化量（抑制高频振动/蜂鸣）。
+const RUNNING_MAX_OUTPUT_STEP_RAW: f32 = 150.0;
 /// 回正完成判据与超时。
-const SETTLE_ERR_RAD: f32 = 0.02;
-const SETTLE_SPEED_RPM: f32 = 15.0;
+const SETTLE_ERR_RAD: f32 = 0.03;
+const SETTLE_SPEED_RPM: f32 = 20.0;
 const SETTLE_TICKS: u16 = 100;
-const PREPARE_TIMEOUT_TICKS: u16 = 3000;
+const PREPARE_TIMEOUT_TICKS: u16 = 5000;
 /// 回正起步的这段时间不做故障判定（允许电机从静止加速）。
 const PREPARE_FAULT_GRACE_TICKS: u16 = 500;
-/// 疑似堵转：目标速度 ≥100 rpm、输出 ≥2000、实际速度 ≤30 rpm，连续 400 ms。
-const STALL_TARGET_RPM: f32 = 100.0;
+/// 疑似堵转：目标速度 ≥20 rpm 且位置误差 ≥0.10 rad、输出 ≥2000、实际速度 ≈0，连续 800 ms。
+const STALL_TARGET_RPM: f32 = 20.0;
 const STALL_OUTPUT_RAW: f32 = 2000.0;
-const STALL_SPEED_RPM: f32 = 30.0;
-const STALL_TICKS: u16 = 400;
-/// 持续高频振荡：250 ms 窗口内 ≥2 个完整往返（≥8 Hz）、峰峰值 ≥0.08 rad、连续 3 窗口。
+const STALL_SPEED_RPM: f32 = 0.5;
+/// 堵转还要求“位置误差确实存在”（rad）：防止重载静止保持（输出很大但误差小）被误判。
+const STALL_ERR_RAD: f32 = 0.10;
+const STALL_TICKS: u16 = 800;
+/// 持续高频振荡：250 ms 窗口内 ≥2 个完整往返（≥8 Hz）、峰峰值 ≥0.04 rad、连续 2 窗口（0.5 s）。
 const OSC_WINDOW_TICKS: u16 = 250;
 const OSC_MIN_CYCLES: u16 = 2;
-const OSC_MIN_P2P_RAD: f32 = 0.08;
-const OSC_MAX_WINDOWS: u8 = 3;
+const OSC_MIN_P2P_RAD: f32 = 0.04;
+const OSC_MAX_WINDOWS: u8 = 2;
 const OSC_SIGN_EPS_RAD: f32 = 0.01;
 /// 限频打印 CAN 编码结果的周期（约 1 s），避免 1 kHz 刷屏。
 const TX_LOG_PERIOD_TICKS: u16 = 1000;
@@ -405,7 +409,9 @@ impl Axis {
     fn update_fault_detection(&mut self) -> Option<AxisFault> {
         // 判据一：疑似堵转 —— 有运动需求、输出大、但实际速度持续很低。
         // 要求“有目标速度”是为了排除静止保持和零速度环调参（位置环 maxout=0）。
-        let has_demand = self.target_rpm.abs() >= STALL_TARGET_RPM;
+        // 有运动需求：目标转速大 **且** 位置误差确实存在（否则重力保持会被误判堵转）。
+        let has_demand = self.target_rpm.abs() >= STALL_TARGET_RPM
+            && self.control_error().abs() >= STALL_ERR_RAD;
         let has_effort = self.motor.command_voltage_raw.abs() >= STALL_OUTPUT_RAW;
         let is_slow = self.motor.speed_rpm.abs() <= STALL_SPEED_RPM;
         if has_demand && has_effort && is_slow {
@@ -524,19 +530,19 @@ impl Default for Control {
                 max_rad: YAW_MAX_RAD,
                 // 位置环：rad → rpm（maxout=0 时输出恒 0，用于单独调速度环）
                 position_pid: Pid::new(PidConfig {
-                    kp: 2.0,               // 位置环 P：现场建议从 100.0 起试（默认 2 偏慢）
+                    kp: 250.0,             // 位置环 P：300→250（回正接近目标更平滑，减少粘滑抖动）
                     ki: 0.0,               // 位置环 I：默认 0
-                    kd: 0.0,               // 位置环 D：超调大再给 0.05~0.2
-                    maxout: 120.0,         // 输出上限=目标转速上限(rpm)；单独调速度环时改 0.0
+                    kd: 0.0,               // 位置环 D：3.0→0（D 放大噪声，先撤；需要时最多 0.05~0.1）
+                    maxout: 90.0,          // 输出上限=目标转速上限(rpm)；单独调速度环时改 0.0
                     integral_limit: 400.0, // 积分限幅
                 }),
                 // 速度环：rpm → 电压原始值（maxout 是台架输出上限）
                 speed_pid: Pid::new(PidConfig {
-                    kp: 30.0,               // 速度环 P：30→60→100…（抖就退回 2/3）
-                    ki: 0.0,                // 速度环 I：pitch 下垂时才加 0.5~1.0
+                    kp: 80.0,               // 速度环 P：60→80（补 droop，减少对积分的依赖）
+                    ki: 8.0,                // 速度环 I：20→8（回正接近目标时减少积分过冲/反向）
                     kd: 0.0,                // 速度环 D：一般保持 0
                     maxout: 5000.0,         // 台架电压上限（协议 ±25000，调试先小）
-                    integral_limit: 3000.0, // 积分限幅
+                    integral_limit: 300.0,  // 积分限幅：800→300
                 }),
                 osc_min_error: f32::MAX,
                 osc_max_error: f32::MIN,
@@ -548,18 +554,18 @@ impl Default for Control {
                 min_rad: Some(PITCH_MIN_RAD),
                 max_rad: Some(PITCH_MAX_RAD),
                 position_pid: Pid::new(PidConfig {
-                    kp: 2.0,               // 位置环 P：现场建议从 100.0 起试
-                    ki: 0.0,               // 位置环 I：默认 0
-                    kd: 0.0,               // 位置环 D：超调大再给 0.05~0.2
-                    maxout: 100.0,         // 输出上限=目标转速上限(rpm)；单独调速度环时改 0.0
+                    kp: 1200.0,   // 位置环 P：1500→1200（回正接近目标更平滑）
+                    ki: 0.0,      // 位置环 I：默认 0
+                    kd: 0.0,      // 位置环 D：超调大再给 0.05~0.2
+                    maxout: 70.0, // 目标转速上限：50→70（用 P 提供爬坡力，降低对积分的依赖）
                     integral_limit: 400.0, // 积分限幅
                 }),
                 speed_pid: Pid::new(PidConfig {
-                    kp: 25.0,               // 速度环 P：25→50→80…（抖就退回 2/3）
-                    ki: 0.0,                // 速度环 I：下垂时才加
+                    kp: 200.0,              // 速度环 P：300→200（降内环增益抑制蜂鸣，同时保住回正爬坡余量）
+                    ki: 100.0,              // 速度环 I：200→100（回正接近目标时减少积分过冲/抖动）
                     kd: 0.0,                // 速度环 D：一般保持 0
-                    maxout: 4000.0,         // 台架电压上限
-                    integral_limit: 3000.0, // 积分限幅
+                    maxout: 10000.0,        // 台架电压上限
+                    integral_limit: 1500.0, // 积分限幅：3000→1500
                 }),
                 osc_min_error: f32::MAX,
                 osc_max_error: f32::MIN,
@@ -869,19 +875,21 @@ impl Control {
         match fault {
             Fault::YawStall => {
                 rtt_target::rprintln!(
-                    "[fault] yaw 疑似堵转: target_rpm={:.0} output={:.0} speed={:.1} stall_ticks={}",
+                    "[fault] yaw 疑似堵转: target_rpm={:.0} output={:.0} speed={:.1} err={:.3} stall_ticks={}",
                     self.yaw.target_rpm,
                     self.yaw.motor.command_voltage_raw,
                     self.yaw.motor.speed_rpm,
+                    self.yaw.control_error(),
                     self.yaw.stall_ticks
                 );
             }
             Fault::PitchStall => {
                 rtt_target::rprintln!(
-                    "[fault] pitch 疑似堵转: target_rpm={:.0} output={:.0} speed={:.1} stall_ticks={}",
+                    "[fault] pitch 疑似堵转: target_rpm={:.0} output={:.0} speed={:.1} err={:.3} stall_ticks={}",
                     self.pitch.target_rpm,
                     self.pitch.motor.command_voltage_raw,
                     self.pitch.motor.speed_rpm,
+                    self.pitch.control_error(),
                     self.pitch.stall_ticks
                 );
             }
@@ -1012,8 +1020,8 @@ impl Control {
             // 调试：摇杆移动目标，双环跟踪。
             State::Running => {
                 self.update_stick_targets();
-                Self::drive_axis(&mut self.yaw, 0.001, None, None, None);
-                Self::drive_axis(&mut self.pitch, 0.001, None, None, None);
+                Self::drive_axis(&mut self.yaw, 0.001, None, None, Some(RUNNING_MAX_OUTPUT_STEP_RAW));
+                Self::drive_axis(&mut self.pitch, 0.001, None, None, Some(RUNNING_MAX_OUTPUT_STEP_RAW));
                 self.detect_faults();
             }
         }
@@ -1106,26 +1114,30 @@ async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
         if log_ticks >= 200 {
             log_ticks = 0;
             rtt_target::rprintln!(
-                "state={:?} fault={:?} tx_failed={} prep={} settle={} | yaw a={:.3} tgt={:.3} \
-                 rpm={:.1} trpm={:.1} out={:.0} stall={} osc={:.1}Hz | pitch a={:.3} tgt={:.3} \
-                 rpm={:.1} trpm={:.1} out={:.0} stall={} osc={:.1}Hz",
+                "state={:?} fault={:?} tx_failed={} prep={} settle={} | yaw j={:.3} raw={:.3} tgt={:.3} \
+                 rpm={:.1} trpm={:.1} out={:.0} cur={} stall={} osc={:.1}Hz | pitch j={:.3} raw={:.3} tgt={:.3} \
+                 rpm={:.1} trpm={:.1} out={:.0} cur={} stall={} osc={:.1}Hz",
                 control.state,
                 control.fault,
                 TX_FAILED.load(Ordering::Relaxed),
                 control.prepare_ticks,
                 control.settle_ticks,
+                control.yaw.joint_angle_rad(),
                 control.yaw.motor.angle_rad,
                 control.yaw.target_angle_rad,
                 control.yaw.motor.speed_rpm,
                 control.yaw.target_rpm,
                 control.yaw.motor.command_voltage_raw,
+                control.yaw.motor.current_raw,
                 control.yaw.stall_ticks,
                 control.yaw.osc_freq_hz,
+                control.pitch.joint_angle_rad(),
                 control.pitch.motor.angle_rad,
                 control.pitch.target_angle_rad,
                 control.pitch.motor.speed_rpm,
                 control.pitch.target_rpm,
                 control.pitch.motor.command_voltage_raw,
+                control.pitch.motor.current_raw,
                 control.pitch.stall_ticks,
                 control.pitch.osc_freq_hz,
             );
